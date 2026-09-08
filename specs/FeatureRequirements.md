@@ -1,8 +1,8 @@
-# Quote Platform — Requirements Document
+# Quote Platform — Product Requirements
 
 **Version:** 0.1 (Draft)
 **Last updated:** 2026-09-07
-**Status:** Pre-architecture review
+**Status:** Draft — product decisions pending
 
 ---
 
@@ -12,49 +12,61 @@ A web application for creating, organizing, ranking, and reacting to "quotes" ti
 
 ---
 
-## 2. Feature Requirements
+## 2. Product Goals
 
-### 2.1 Quotes & Collections
+The application helps users capture memorable quotes, organize them into collections, rank and react to them, and review how quotes change over time. A companion Discord bot allows quotes and activity to be captured from Discord.
+
+The v1 product prioritizes reliable quote and collection workflows, clear collection-level permissions, and a simple Discord ingestion path.
+
+## 3. Feature Requirements
+
+### 3.1 Quotes & Collections
 - Users can create quotes, each associated with a collection.
-- **Open decision:** can a quote belong to multiple collections, or exactly one?
+- A quote belongs to exactly one collection in v1. See ADR-001 for the migration path to multiple collections.
 - Quotes can be associated with a speaker in one of two ways:
   - A person already added to the collection (referenced by a display/fake name)
   - An individual not yet added to the collection (unlinked/free-text speaker)
-- **Design recommendation:** model "speaker" as its own polymorphic entity (`LINKED` vs `UNLINKED`) rather than scattering nullable foreign keys across the schema.
-- **Open decision:** if an unlinked speaker is later added to the collection, do historical quotes retroactively relink to them?
+- Speaker identity is modeled as a first-class entity. A quote may reference a collection speaker or retain an unlinked speaker name.
+- Relinking an unlinked speaker is an explicit moderator action and must create quote revisions; it is never performed implicitly by name matching.
 
-### 2.2 Tierlists
+### 3.2 Tierlists
 - Users can rank quotes within a collection using a tierlist.
-- **Open decision:** is the tierlist a single shared/global ranking per collection, or does each user maintain their own personal ranking of the same quote pool? This materially changes the data model and concurrency handling.
+- Tierlists are personal per-user rankings in v1. A collection may expose an optional aggregate view, but the source of truth is each user's ranking.
 
-### 2.3 Reactions
+### 3.3 Reactions
 - Users can react to quotes.
-- **Open decision:** fixed set of reaction types (enum) vs. open-ended/custom reactions (affects schema and Discord sync).
+- Reactions use a fixed, application-defined set in v1. Users may have at most one reaction of each type per quote.
 
-### 2.4 Quote Changelogs
+### 3.4 Quote Changelogs
 - All quote edits must produce a changelog entry.
 - Changelogs should support diffs (what changed, not just that something changed), not just a generic audit log line.
 - **Design recommendation:** implement as a `quote_revision` table (event-sourcing-lite) rather than a generic audit log.
 
-### 2.5 Users, Friends & Blocking
+### 3.5 Users, Friends & Blocking
 - Users can send/accept friend requests.
 - Users can block other users.
-- **Open decision:** does blocking hide a blocked user's quotes/reactions, prevent interaction only, or both?
-- **Open decision:** should friendship grant elevated visibility into private collections (e.g., an implicit Viewer role for friends of members)?
+- Blocking prevents direct interaction and hides the blocked user's content and reactions from the blocker. Existing collection permissions still govern content visible to other users.
+- Friendship does not grant implicit access to private collections. Private collection access is explicit and represented as a collection membership/role.
 
-### 2.6 Collection Visibility
+### 3.6 Collection Visibility
 - Collections can be marked public or private.
 - **Future consideration (not required for v1):** quote-level visibility overrides within a collection, for cases where a private collection still needs to hide a specific sensitive quote.
 
-### 2.7 Discord Integration
+### 3.7 Discord Integration
 - A dedicated Discord bot connects Discord servers to the web application.
-- **Open decision:** bot direction of sync — does it only ingest quotes from Discord into the app, only post app activity back to Discord, or both (bidirectional)?
-- **Open decision:** does one bot instance serve multiple Discord guilds, and how does a guild map to a collection (1:1, many:1)?
+- The v1 bot ingests quotes from Discord into the application. Posting application activity back to Discord is deferred.
+- One bot installation may serve multiple guilds. A guild may map to multiple collections, with the source channel selecting the collection.
 - Bot must respect Discord's own outbound rate limits, independent of the application's internal rate limiting (see 3.3).
 
-### 2.8 Authentication
+### 3.8 Authentication
 - Account creation via OAuth.
 - Discord OAuth is recommended as the primary provider, given the existing bot integration.
+
+### 3.9 Accessibility and Responsive UI
+- Primary workflows must target WCAG 2.1 AA.
+- The application must be usable on mobile phones, tablets, and desktop screens without requiring horizontal scrolling for primary workflows.
+- Quote browsing, quote creation, search, reactions, tierlist ranking, authentication, and moderation must be usable with touch, keyboard, and supported assistive technologies.
+- Responsive layouts must preserve access to essential actions at small viewport widths; actions must not depend on hover alone.
 
 ---
 
@@ -72,13 +84,13 @@ A web application for creating, organizing, ranking, and reacting to "quotes" ti
 | Viewer | Read-only (public collections, or private collections shared with friends) |
 
 - Separate **global/platform roles** (e.g., Admin, Support) exist for cross-collection moderation.
-- API keys carry independent scopes (read-only vs. write) that are not directly tied to the issuing user's role, so a leaked key cannot grant more access than it was scoped for.
+- API keys have explicit scopes, but effective access is the intersection of the key scope, the issuing user's current permissions, and resource visibility. A key cannot grant access the user does not have.
 - **Design recommendation:** model roles and permissions as database-backed tables (`role`, `permission`), not hardcoded enums, so permission sets can change without a redeploy.
 
 ### 3.2 Search
 - Full-text search over quotes.
 - **Design recommendation:** start with Postgres `tsvector`/`pg_trgm`; avoid introducing Elasticsearch/OpenSearch until there's a concrete scaling need.
-- **Open decision:** search scope — within a single collection, across all collections a user has access to, or global search limited to public collections.
+- Search is available within a collection and across collections the user can access. Public-only global search is deferred.
 - Search results must respect RBAC and blocking rules (no surfacing private-collection content or blocked users' content).
 
 ### 3.3 Rate Limiting
@@ -109,13 +121,12 @@ A web application for creating, organizing, ranking, and reacting to "quotes" ti
 ## 4. Technical Requirements
 
 ### 4.1 Scale
-- Must support at least 1,000 concurrent users.
-- **Open decision:** clarify whether "concurrent users" means concurrent live connections (WebSocket/API) or a sustained requests/sec target — this determines caching and read-replica strategy up front.
+- Must support 1,000 simultaneously authenticated users, 100 sustained requests per second for 15 minutes, and short bursts of 250 requests per second.
 
 ### 4.2 API & Error Handling
 - Expose an OpenAPI specification; support application-issued API keys (see 3.1 for scoping).
 - Errors must propagate to the frontend with actionable, field-level feedback.
-- **Design recommendation:** adopt RFC 7807 (Problem Details) as the standard error response shape; Spring Boot 6+ supports this natively via `ProblemDetail`.
+- Use RFC 7807 Problem Details for errors. Validation errors must include machine-readable codes and field-level details.
 
 ### 4.3 Data Layer
 - PostgreSQL as the primary database.
@@ -130,35 +141,26 @@ A web application for creating, organizing, ranking, and reacting to "quotes" ti
 - **Design recommendation:** pair with Grafana for dashboards, and consider OpenTelemetry for distributed tracing plus centralized logging (e.g., Loki/ELK) once production debugging becomes routine.
 
 ### 4.6 Frontend
-- React with shadcn as the primary component library.
+- React with shadcn as the primary component library and TanStack Router for routing.
 
 ### 4.7 Infrastructure
 - Containerization via Docker.
-- Orchestration via Kubernetes.
-- **Consideration:** evaluate whether Docker Compose or a single-node deployment (e.g., Fly.io, ECS) gets the project to launch faster, with Kubernetes introduced later as load justifies it, rather than committing to full K8s for v1.
+- Local development must work with Docker Compose.
+- Production orchestration remains conditional; Kubernetes is introduced only when load or operational requirements justify it.
 
 ### 4.8 Real-Time Updates
-- Reactions, tierlist changes, and moderation actions are strong candidates for real-time delivery (WebSockets or Server-Sent Events) rather than client polling.
-- **Open decision:** scope of real-time features for v1 vs. later iteration.
+- Real-time delivery is out of scope for v1. The client uses normal API reads and writes; the transport can be added later without changing the domain model.
 
 ---
 
-## 5. Open Decisions Summary
+## 5. Remaining Product Decisions
 
 | # | Topic | Decision Needed |
 |---|---|---|
-| 1 | Quotes & collections | Can a quote belong to multiple collections? |
-| 2 | Tierlists | Global per-collection ranking, or per-user personal ranking? |
-| 3 | Reactions | Fixed enum or open/custom reaction types? |
-| 4 | Speaker relinking | Do old quotes retroactively relink when an unlinked speaker joins the collection? |
-| 5 | Blocking | Does blocking hide content, restrict interaction, or both? |
-| 6 | Friends & visibility | Do friends get implicit Viewer access to private collections? |
-| 7 | Discord bot direction | Ingest-only, post-back-only, or bidirectional sync? |
-| 8 | Discord guild mapping | Does one bot serve multiple guilds, and how do guilds map to collections? |
-| 9 | Concurrency definition | Concurrent connections vs. requests/sec for the 1,000-user target? |
-| 10 | Search scope | Per-collection, cross-collection, or public-only global search? |
-| 11 | Infrastructure | Full Kubernetes at launch, or simpler deployment first? |
-| 12 | Real-time scope | Which features need real-time delivery in v1? |
+| 1 | Infrastructure | Full Kubernetes at launch, or a simpler deployment first? |
+| 2 | Moderation | What actions can reviewers take, and what is the appeal/retention policy? |
+| 3 | Discord parsing | Which message format or command creates a quote, and which channels are allowed? |
+| 4 | Tierlist presentation | What tier names, ordering, and aggregate views should the UI provide? |
 
 ---
 
@@ -170,4 +172,4 @@ A web application for creating, organizing, ranking, and reacting to "quotes" ti
 
 ---
 
-*Next steps: resolve open decisions in Section 5, then proceed to ERD and system architecture design.*
+*Next steps: resolve the remaining decisions in Section 5, review the ADRs, then proceed to the ERD and system architecture design.*
